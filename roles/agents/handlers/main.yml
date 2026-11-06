@@ -1,0 +1,2 @@
+- name: Redémarrer hermes
+  ansible.builtin.command: docker restart hermes

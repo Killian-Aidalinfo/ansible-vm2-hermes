@@ -65,3 +65,19 @@
 - name: Pare-feu - activer ufw si inactif
   ansible.builtin.command: ufw --force enable
   when: "'Status: active' not in ufw_state.stdout"
+
+# 4 Go de RAM : Hindsight charge ses modèles d'embeddings et de reranking en mémoire.
+- name: Créer un fichier d'échange de {{ swap_size }}
+  ansible.builtin.command: "fallocate -l {{ swap_size }} /swapfile"
+  args:
+    creates: /swapfile
+  register: swapfile
+
+- name: Formater le fichier d'échange
+  ansible.builtin.shell: chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  when: swapfile is changed
+
+- name: Activer le fichier d'échange au boot
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    line: /swapfile none swap sw 0 0

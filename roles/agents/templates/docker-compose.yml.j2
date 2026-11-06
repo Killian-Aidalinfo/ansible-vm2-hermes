@@ -1,0 +1,43 @@
+# Géré par Ansible
+name: agents
+
+services:
+  hindsight-db:
+    image: {{ hindsight_db_image }}
+    restart: unless-stopped
+    env_file: hindsight-db.env
+    volumes:
+      - hindsight-db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hindsight -d hindsight"]
+      interval: 10s
+      retries: 10
+
+  hindsight:
+    image: {{ hindsight_image }}
+    restart: unless-stopped
+    shm_size: 1g
+    stop_grace_period: 75s
+    env_file: hindsight.env
+    depends_on:
+      hindsight-db:
+        condition: service_healthy
+    ports:  # API et interface accessibles par tunnel SSH uniquement
+      - 127.0.0.1:8888:8888
+      - 127.0.0.1:9999:9999
+
+  hermes:
+    image: {{ hermes_image }}
+    container_name: hermes
+    restart: unless-stopped
+    command: ["gateway", "run"]
+    environment:
+      HERMES_UID: "1000"  # fichiers de {{ hermes_home }} éditables par {{ admin_user }}
+      HERMES_GID: "1000"
+    volumes:
+      - {{ hermes_home }}:/opt/data
+    depends_on:
+      - hindsight
+
+volumes:
+  hindsight-db:

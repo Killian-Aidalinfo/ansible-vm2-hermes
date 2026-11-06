@@ -1,0 +1,89 @@
+- name: Créer les dossiers de la stack et de Hermes
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0700"
+  loop:
+    - { path: "{{ agents_dir }}", owner: root }
+    - { path: "{{ hermes_home }}", owner: "1000" }
+    - { path: "{{ hermes_home }}/hindsight", owner: "1000" }
+
+- name: Écrire le compose et les fichiers d'environnement de Hindsight
+  ansible.builtin.template:
+    src: "{{ item }}.j2"
+    dest: "{{ agents_dir }}/{{ item }}"
+    mode: "0600"
+  loop: [docker-compose.yml, hindsight-db.env, hindsight.env]
+  register: stack_files
+  no_log: true
+
+- name: Brancher le plugin Hindsight de Hermes sur le serveur local
+  ansible.builtin.template:
+    src: hindsight-config.json.j2
+    dest: "{{ hermes_home }}/hindsight/config.json"
+    owner: "1000"
+    group: "1000"
+    mode: "0600"
+  no_log: true
+  notify: Redémarrer hermes
+
+- name: Créer le .env de Hermes (complété à la main pour le token du bot)
+  ansible.builtin.file:
+    path: "{{ hermes_home }}/.env"
+    state: touch
+    owner: "1000"
+    group: "1000"
+    mode: "0600"
+    modification_time: preserve
+    access_time: preserve
+
+- name: Mettre la clé LLM dans le .env de Hermes
+  ansible.builtin.lineinfile:
+    path: "{{ hermes_home }}/.env"
+    regexp: "^{{ hermes_llm_env[llm_provider] }}="
+    line: "{{ hermes_llm_env[llm_provider] }}={{ llm_api_key }}"
+  when: llm_api_key | length > 0
+  no_log: true
+  notify: Redémarrer hermes
+
+- name: Démarrer la stack (Hindsight, sa base, Hermes)
+  community.docker.docker_compose_v2:
+    project_src: "{{ agents_dir }}"
+    pull: missing
+    recreate: "{{ 'always' if stack_files is changed else 'auto' }}"
+    wait: false
+
+- name: Attendre que l'API Hindsight soit prête
+  ansible.builtin.uri:
+    url: http://127.0.0.1:8888/health/ready
+  register: hindsight_health
+  until: hindsight_health.status == 200
+  retries: 60
+  delay: 10
+
+- name: État du fournisseur de mémoire de Hermes
+  ansible.builtin.command: docker exec hermes hermes memory status
+  register: hermes_memory
+  changed_when: false
+  retries: 12
+  delay: 10
+  until: hermes_memory.rc == 0
+
+# « available » exige le plugin ET son client Python : sans --yes-deps, l'installation non
+# interactive saute les dépendances et le plugin reste « not available ».
+- name: Installer le plugin Hindsight avec ses dépendances (version épinglée par le catalogue Hermes)
+  ansible.builtin.command: docker exec hermes hermes plugins install hindsight --force --yes-deps --enable
+  when: "'available ✓' not in hermes_memory.stdout"
+  notify: Redémarrer hermes
+
+- name: Lire la configuration de Hermes
+  ansible.builtin.slurp:
+    src: "{{ hermes_home }}/config.yaml"
+  register: hermes_config_raw
+
+- name: Choisir Hindsight comme fournisseur de mémoire
+  ansible.builtin.command: docker exec hermes hermes config set memory.provider hindsight
+  when: ((hermes_config_raw.content | b64decode | from_yaml).memory | default({})).provider | default('') != 'hindsight'
+  notify: Redémarrer hermes
