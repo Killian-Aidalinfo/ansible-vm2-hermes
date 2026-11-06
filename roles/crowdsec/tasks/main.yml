@@ -1,0 +1,153 @@
+- name: Ajouter le dépôt CrowdSec (packagecloud)
+  ansible.builtin.deb822_repository:
+    name: crowdsec
+    types: deb
+    uris: https://packagecloud.io/crowdsec/crowdsec/any/
+    suites: any
+    components: main
+    signed_by: https://packagecloud.io/crowdsec/crowdsec/gpgkey
+
+- name: Installer le moteur CrowdSec
+  ansible.builtin.apt:
+    name: crowdsec
+    update_cache: true
+
+# À installer tant que l'API écoute encore sur 127.0.0.1 : le script du paquet démarre le
+# bouncer avec cette adresse et échoue sinon. On le rebranche plus bas avec sa propre clé.
+- name: Installer le bouncer firewall nftables
+  ansible.builtin.apt:
+    name: crowdsec-firewall-bouncer-nftables
+
+# L'API écoute sur docker0 ; ip_nonlocal_bind la laisse démarrer avant Docker au boot.
+- name: Autoriser l'écoute sur une adresse pas encore présente
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_nonlocal_bind
+    value: "1"
+    sysctl_file: /etc/sysctl.d/60-crowdsec-lapi.conf
+
+- name: API locale et métriques sur {{ crowdsec_lapi_addr }}
+  ansible.builtin.replace:
+    path: /etc/crowdsec/config.yaml
+    regexp: "{{ item.re }}"
+    replace: "{{ item.to }}"
+  loop:
+    - { re: 'listen_uri: \S+', to: "listen_uri: {{ crowdsec_lapi_addr }}:{{ crowdsec_lapi_port }}" }
+    - { re: '^(\s+listen_addr:) \S+$', to: '\1 {{ crowdsec_lapi_addr }}' }  # seul listen_addr : bloc prometheus
+  notify: Redémarrer crowdsec
+
+- name: Pointer cscli vers la nouvelle adresse de l'API
+  ansible.builtin.lineinfile:
+    path: /etc/crowdsec/local_api_credentials.yaml
+    regexp: '^url:'
+    line: "url: http://{{ crowdsec_lapi_addr }}:{{ crowdsec_lapi_port }}"
+  notify: Redémarrer crowdsec
+
+- name: Installer les collections (SSH, Linux, Traefik, attaques HTTP)
+  ansible.builtin.command: "cscli collections install crowdsecurity/{{ item }}"
+  args:
+    creates: "/etc/crowdsec/collections/{{ item }}.yaml"
+  loop: [linux, sshd, traefik, http-cve, base-http-scenarios]
+  notify: Redémarrer crowdsec
+
+- name: Lire les logs d'accès Traefik
+  ansible.builtin.copy:
+    dest: /etc/crowdsec/acquis.d/traefik.yaml
+    mode: "0644"
+    content: |
+      filenames:
+        - /var/log/traefik/access.log
+      labels:
+        type: traefik
+  notify: Redémarrer crowdsec
+
+- name: Créer le dossier des logs Traefik (CrowdSec doit le trouver au démarrage)
+  ansible.builtin.file:
+    path: /var/log/traefik
+    state: directory
+    mode: "0755"
+
+- name: Scénario SSH strict (bots lents et distribués)
+  ansible.builtin.copy:
+    src: ssh-bots-strict.yaml
+    dest: /etc/crowdsec/scenarios/ssh-bots-strict.yaml
+    mode: "0644"
+  notify: Redémarrer crowdsec
+
+- name: Profils de décision (24 h pour le scénario strict, 4 h sinon)
+  ansible.builtin.copy:
+    src: profiles.yaml
+    dest: /etc/crowdsec/profiles.yaml
+    mode: "0644"
+  notify: Redémarrer crowdsec
+
+- name: Appliquer la configuration CrowdSec
+  ansible.builtin.meta: flush_handlers
+
+- name: Attendre l'API locale
+  ansible.builtin.wait_for:
+    host: "{{ crowdsec_lapi_addr }}"
+    port: "{{ crowdsec_lapi_port }}"
+    timeout: 60
+
+- name: Lister les bouncers enregistrés
+  ansible.builtin.command: cscli bouncers list -o json
+  register: bouncers_raw
+  changed_when: false
+
+- name: Repérer les bouncers existants
+  ansible.builtin.set_fact:
+    bouncer_names: "{{ (bouncers_raw.stdout | from_json or []) | map(attribute='name') | list }}"
+
+# Le paquet s'enregistre tout seul sous un nom aléatoire ; une clé dédiée évite les doublons nom@IP.
+- name: Créer la clé du bouncer firewall
+  ansible.builtin.command: cscli bouncers add cs-firewall-bouncer -o raw
+  register: fw_key
+  when: "'cs-firewall-bouncer' not in bouncer_names"
+  no_log: true
+
+- name: Configurer le bouncer firewall (API, clé, chaînes input et forward)
+  ansible.builtin.replace:
+    path: /etc/crowdsec/bouncers/crowdsec-firewall-bouncer.yaml
+    regexp: "{{ item.re }}"
+    replace: "{{ item.to }}"
+  loop: >-
+    {{ [{'re': '^api_url: .*$', 'to': 'api_url: http://' ~ crowdsec_lapi_addr ~ ':' ~ crowdsec_lapi_port ~ '/'}]
+       + ([{'re': '^api_key: .*$', 'to': 'api_key: ' ~ fw_key.stdout | trim}] if fw_key is changed else []) }}
+  no_log: true
+  notify: Redémarrer le bouncer firewall
+
+- name: Supprimer les enregistrements automatiques du paquet
+  ansible.builtin.command: "cscli bouncers delete {{ item }}"
+  loop: "{{ bouncer_names | select('match', '^cs-firewall-bouncer-') | list }}"
+
+- name: Créer la clé du bouncer Traefik
+  ansible.builtin.shell: |
+    set -o pipefail
+    cscli bouncers add traefik-bouncer -o raw > /etc/crowdsec/traefik-bouncer.key
+  args:
+    executable: /bin/bash
+    creates: /etc/crowdsec/traefik-bouncer.key
+  when: "'traefik-bouncer' not in bouncer_names"
+
+- name: Protéger la clé du bouncer Traefik
+  ansible.builtin.file:
+    path: /etc/crowdsec/traefik-bouncer.key
+    mode: "0600"
+
+- name: Lire la clé du bouncer Traefik
+  ansible.builtin.slurp:
+    src: /etc/crowdsec/traefik-bouncer.key
+  register: traefik_key_file
+  no_log: true
+
+- name: Garder la clé pour le rôle monitoring
+  ansible.builtin.set_fact:
+    crowdsec_traefik_key: "{{ traefik_key_file.content | b64decode | trim }}"
+  no_log: true
+
+- name: Démarrer les services CrowdSec au boot
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: [crowdsec, crowdsec-firewall-bouncer]

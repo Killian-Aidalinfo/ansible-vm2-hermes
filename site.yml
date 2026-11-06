@@ -1,0 +1,8 @@
+# Lancer : ansible-playbook site.yml
+- name: Socle de la VM 2 (avant Hermes et Hindsight)
+  hosts: vm2
+  become: true
+  roles:
+    - base      # apt update/upgrade, durcissement SSH, pare-feu ufw
+    - docker    # Docker CE + plugin compose depuis le dépôt officiel
+    - crowdsec  # moteur sur l'hôte, bouncer nftables, scénario SSH strict

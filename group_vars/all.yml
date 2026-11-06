@@ -1,0 +1,6 @@
+admin_user: etudiant
+
+# API locale CrowdSec sur le bridge docker0 : un futur Traefik (plugin bouncer) la joindra.
+crowdsec_lapi_addr: 172.17.0.1
+crowdsec_lapi_port: 8080
+crowdsec_metrics_port: 6060

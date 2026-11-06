@@ -1,0 +1,67 @@
+- name: Mettre à jour le système (apt update + upgrade)
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: dist
+    autoremove: true
+
+- name: Installer les outils de base
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, gnupg, ufw, git, jq, htop, apache2-utils, python3-debian, unattended-upgrades]
+
+- name: Redémarrage nécessaire après mise à jour ?
+  ansible.builtin.stat:
+    path: /var/run/reboot-required
+  register: reboot_required
+
+- name: Redémarrer si le noyau a changé
+  ansible.builtin.reboot:
+  when: reboot_required.stat.exists
+
+- name: Durcir sshd (fichier lu en premier, il l'emporte sur 50-cloud-init.conf)
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/00-hardening.conf
+    mode: "0644"
+    content: |
+      # Géré par Ansible
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+      MaxAuthTries 3
+      LoginGraceTime 30
+      X11Forwarding no
+  notify: Recharger ssh
+
+- name: Vérifier la configuration sshd avant de recharger
+  ansible.builtin.command: sshd -t
+  changed_when: false
+
+- name: Pare-feu - politique par défaut
+  ansible.builtin.command: "ufw default {{ item.policy }} {{ item.dir }}"
+  loop:
+    - { policy: deny, dir: incoming }
+    - { policy: allow, dir: outgoing }
+  changed_when: false  # ufw répond « changed » même quand la politique est déjà la bonne
+
+- name: Pare-feu - ouvrir SSH, HTTP et HTTPS
+  ansible.builtin.command: "ufw allow {{ item }}"
+  loop: [22/tcp, 80/tcp, 443/tcp]
+  register: ufw_allow
+  changed_when: "'Skipping' not in ufw_allow.stdout"
+
+# Les conteneurs (172.16.0.0/12) joignent l'API CrowdSec et ses métriques sur l'hôte.
+- name: Pare-feu - autoriser les conteneurs vers CrowdSec
+  ansible.builtin.command: >-
+    ufw allow in from 172.16.0.0/12 to {{ crowdsec_lapi_addr }} port {{ item }} proto tcp
+  loop: ["{{ crowdsec_lapi_port }}", "{{ crowdsec_metrics_port }}"]
+  register: ufw_cs
+  changed_when: "'Skipping' not in ufw_cs.stdout"
+
+- name: Pare-feu - état actuel
+  ansible.builtin.command: ufw status
+  register: ufw_state
+  changed_when: false
+
+- name: Pare-feu - activer ufw si inactif
+  ansible.builtin.command: ufw --force enable
+  when: "'Status: active' not in ufw_state.stdout"

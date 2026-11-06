@@ -1,0 +1,26 @@
+- name: Ajouter le dépôt officiel Docker
+  ansible.builtin.deb822_repository:
+    name: docker
+    types: deb
+    uris: https://download.docker.com/linux/ubuntu
+    suites: "{{ ansible_facts['distribution_release'] }}"
+    components: stable
+    architectures: amd64
+    signed_by: https://download.docker.com/linux/ubuntu/gpg
+
+- name: Installer Docker CE et le plugin compose
+  ansible.builtin.apt:
+    name: [docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin]
+    update_cache: true
+
+- name: Démarrer Docker au boot
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: "Ajouter {{ admin_user }} au groupe docker"
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    groups: docker
+    append: true

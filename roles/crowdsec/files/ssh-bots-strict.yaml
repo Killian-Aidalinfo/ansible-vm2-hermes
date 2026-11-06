@@ -1,0 +1,20 @@
+# Mots de passe désactivés sur cette VM : tout échec SSH (root, compte inexistant)
+# vient d un robot. 3 connexions en échec en environ 1 h depuis une IP => alerte.
+type: leaky
+name: local/ssh-bots-strict
+description: "Échecs SSH répétés lents (auth par mot de passe désactivée)"
+filter: "evt.Meta.log_type == 'ssh_failed-auth'"
+groupby: evt.Meta.source_ip
+distinct: evt.Parsed.pid   # une connexion sshd = un essai, même si elle logue plusieurs lignes
+leakspeed: 30m
+capacity: 2
+blackhole: 5m
+labels:
+  service: ssh
+  confidence: 3
+  spoofable: 0
+  classification:
+    - attack.T1110
+  label: "SSH bots (lent et distribué)"
+  behavior: "ssh:bruteforce"
+  remediation: true
